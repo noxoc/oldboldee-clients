@@ -1,0 +1,737 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Oldboldee Client DB</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300..700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+</head>
+<body>
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.11.0/firebase-app.js";
+import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.11.0/firebase-auth.js";
+import { getFirestore, collection, doc, addDoc, updateDoc, deleteDoc, onSnapshot, serverTimestamp, query, orderBy } from "https://www.gstatic.com/firebasejs/10.11.0/firebase-firestore.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyDrC3II8wgWZ7TcjM_FXl8LTb5_hL1Dwj4",
+  authDomain: "oldboldee-db.firebaseapp.com",
+  projectId: "oldboldee-db",
+  storageBucket: "oldboldee-db.firebasestorage.app",
+  messagingSenderId: "399674009019",
+  appId: "1:399674009019:web:992018a3a4f06564be109e"
+};
+
+const app   = initializeApp(firebaseConfig);
+const auth  = getAuth(app);
+const db    = getFirestore(app);
+
+// ── STATE ──────────────────────────────────────────────
+const DEFAULT_NICHES = ['Firefighter','USCG','Tactical'];
+let clients      = [];
+let actLog       = [];
+let customNiches = [];
+let sortMode     = 'default';
+let inlineEditId = null;
+let pendingDeleteId = null;
+let unsubClients = null;
+let unsubLog     = null;
+
+try { customNiches = JSON.parse(localStorage.getItem('odb_niches') || '[]'); } catch(e){}
+
+function allNiches() { return [...DEFAULT_NICHES, ...customNiches]; }
+function saveNiches() { try { localStorage.setItem('odb_niches', JSON.stringify(customNiches)); } catch(e){} }
+function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2,6); }
+function escH(s) {
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ── AUTH ───────────────────────────────────────────────
+onAuthStateChanged(auth, user => {
+  if (user) {
+    document.getElementById('screenLogin').style.display = 'none';
+    document.getElementById('screenApp').style.display   = 'block';
+    document.getElementById('userEmail').textContent = user.email;
+    startListeners();
+  } else {
+    document.getElementById('screenLogin').style.display = 'flex';
+    document.getElementById('screenApp').style.display   = 'none';
+    if (unsubClients) { unsubClients(); unsubClients = null; }
+    if (unsubLog)     { unsubLog();     unsubLog = null; }
+    clients = []; actLog = [];
+  }
+});
+
+document.getElementById('loginForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  const email = document.getElementById('loginEmail').value.trim();
+  const pass  = document.getElementById('loginPass').value;
+  const btn   = document.getElementById('btnLogin');
+  const err   = document.getElementById('loginError');
+  btn.textContent = 'Masuk...';
+  btn.disabled = true;
+  err.textContent = '';
+  try {
+    await signInWithEmailAndPassword(auth, email, pass);
+  } catch(ex) {
+    err.textContent = 'Email atau password salah.';
+    btn.textContent = 'Masuk';
+    btn.disabled = false;
+  }
+});
+
+document.getElementById('btnLogout').addEventListener('click', () => signOut(auth));
+
+// ── FIRESTORE LISTENERS ────────────────────────────────
+function startListeners() {
+  const qC = query(collection(db,'clients'), orderBy('createdAt','desc'));
+  unsubClients = onSnapshot(qC, snap => {
+    clients = snap.docs.map(d => ({id:d.id,...d.data()}));
+    renderTable();
+  });
+  const qL = query(collection(db,'log'), orderBy('ts','desc'));
+  unsubLog = onSnapshot(qL, snap => {
+    actLog = snap.docs.map(d => ({id:d.id,...d.data()}));
+    updateLogCount();
+    if (document.getElementById('panel-log').classList.contains('active')) renderLog();
+  });
+}
+
+// ── LOG ────────────────────────────────────────────────
+async function addLog(type, ig, desc) {
+  try {
+    await addDoc(collection(db,'log'), {type, ig, desc, ts: serverTimestamp()});
+  } catch(e){}
+}
+function updateLogCount() {
+  document.getElementById('logCount').textContent = actLog.length + ' aktivitas';
+}
+function renderLog() {
+  updateLogCount();
+  const el = document.getElementById('logList');
+  if (!actLog.length) {
+    el.innerHTML = '<div class="empty-state"><svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg><h3>Belum ada aktivitas</h3><p>Log muncul setiap ada perubahan data.</p></div>';
+    return;
+  }
+  const icons = {
+    add:  '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 5v14M5 12h14"/></svg>',
+    sub:  '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12h14"/></svg>',
+    new:  '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>',
+    del:  '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/></svg>',
+    edit: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>'
+  };
+  const typeMap = {new:'Tambah Client',add:'Order +1',sub:'Order -1',edit:'Edit Data',del:'Hapus Client'};
+  el.innerHTML = actLog.map(l => {
+    const ts = l.ts ? new Date(l.ts.seconds*1000).toLocaleString('id-ID',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'}) : '—';
+    return `<div class="log-item"><div class="log-icon ${l.type}">${icons[l.type]||icons.edit}</div><div class="log-info"><div class="log-ig">${escH(l.ig)}</div><div class="log-desc">${escH(l.desc)}</div></div><div class="log-time">${ts}</div></div>`;
+  }).join('');
+}
+
+// ── NICHE ──────────────────────────────────────────────
+function nicheClass(n) {
+  if (!n) return 'nb-none';
+  const l = n.toLowerCase();
+  if (l==='firefighter') return 'nb-ff';
+  if (l==='uscg')        return 'nb-uscg';
+  if (l==='tactical')    return 'nb-tac';
+  return 'nb-custom';
+}
+function nicheBadge(n) {
+  return `<span class="niche-badge ${nicheClass(n)}">${escH(n||'—')}</span>`;
+}
+function buildNicheOpts(selected) {
+  let h = '<option value="">— Pilih Niche —</option>';
+  allNiches().forEach(n => { h += `<option value="${escH(n)}"${n===selected?' selected':''}>${escH(n)}</option>`; });
+  return h;
+}
+function refreshFilterNiche() {
+  const sel = document.getElementById('filterNiche');
+  const cur = sel.value;
+  let h = '<option value="">Semua Niche</option>';
+  allNiches().forEach(n => { h += `<option value="${escH(n)}"${n===cur?' selected':''}>${escH(n)}</option>`; });
+  sel.innerHTML = h;
+}
+
+// ── TABS ───────────────────────────────────────────────
+document.getElementById('tabClients').addEventListener('click', function() {
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
+  this.classList.add('active');
+  document.getElementById('panel-clients').classList.add('active');
+});
+document.getElementById('tabLog').addEventListener('click', function() {
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
+  this.classList.add('active');
+  document.getElementById('panel-log').classList.add('active');
+  renderLog();
+});
+
+// ── SORT ───────────────────────────────────────────────
+document.querySelectorAll('.sort-btn').forEach(btn => {
+  btn.addEventListener('click', function() {
+    sortMode = this.dataset.sort;
+    document.querySelectorAll('.sort-btn').forEach(b=>b.classList.remove('active'));
+    this.classList.add('active');
+    renderTable();
+  });
+});
+
+// ── RENDER TABLE ───────────────────────────────────────
+function getFiltered() {
+  const q  = document.getElementById('searchInput').value.toLowerCase().trim();
+  const fn = document.getElementById('filterNiche').value;
+  let list = clients.slice();
+  if (q)  list = list.filter(c => c.ig.toLowerCase().includes(q)||(c.wa||'').includes(q)||(c.niche||'').toLowerCase().includes(q));
+  if (fn) list = list.filter(c => c.niche===fn);
+  if (sortMode==='name')   list.sort((a,b)=>a.ig.localeCompare(b.ig));
+  if (sortMode==='orders') list.sort((a,b)=>b.orders-a.orders);
+  if (sortMode==='niche')  list.sort((a,b)=>(a.niche||'').localeCompare(b.niche||''));
+  return list;
+}
+function renderTable() {
+  document.getElementById('statClients').textContent = clients.length;
+  document.getElementById('statOrders').textContent  = clients.reduce((s,c)=>s+c.orders,0);
+  refreshFilterNiche();
+  const list  = getFiltered();
+  const tbody = document.getElementById('tableBody');
+  if (!list.length) {
+    const q = document.getElementById('searchInput').value;
+    tbody.innerHTML = `<tr><td colspan="6"><div class="empty-state"><svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg><h3>${q?'Tidak ditemukan':'Belum ada client'}</h3><p>${q?'Coba kata kunci lain.':'Klik Tambah untuk mulai.'}</p>${!q?'<button class="btn btn-primary" id="emptyAddBtn">+ Tambah Client</button>':''}</div></td></tr>`;
+    if (!q) { const eb=document.getElementById('emptyAddBtn'); if(eb) eb.addEventListener('click',openModal); }
+    return;
+  }
+  tbody.innerHTML = list.map((c,i) => {
+    const isIE  = inlineEditId===c.id;
+    const level = c.orders>=5?'high':c.orders>=2?'med':'low';
+    const ig    = c.ig.startsWith('@')?c.ig:'@'+c.ig;
+    const init  = ig.replace('@','').slice(0,1).toUpperCase();
+    const waLink = c.wa?'https://wa.me/'+c.wa.replace(/[^0-9]/g,''):'';
+    if (isIE) {
+      return `<tr id="row-${c.id}" style="background:var(--surf3)">
+        <td class="cell-num">${i+1}</td>
+        <td><input class="inline-field" data-ie="ig" value="${escH(c.ig)}" placeholder="@username"></td>
+        <td><input class="inline-field" data-ie="wa" value="${escH(c.wa||'')}" placeholder="08xx"></td>
+        <td><select class="inline-select" data-ie="niche">${buildNicheOpts(c.niche||'')}</select></td>
+        <td><input class="inline-field inline-num" data-ie="ord" type="number" value="${c.orders}" min="0"></td>
+        <td class="cell-actions">
+          <button class="action-btn save-ok" data-action="save-inline" data-id="${c.id}" title="Simpan"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg></button>
+          <button class="action-btn" data-action="cancel-inline" title="Batal"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+        </td></tr>`;
+    }
+    return `<tr id="row-${c.id}">
+      <td class="cell-num">${i+1}</td>
+      <td class="cell-ig"><a href="https://instagram.com/${ig.replace('@','')}" target="_blank" rel="noopener"><div class="ig-avatar">${init}</div><span>${escH(ig)}</span></a></td>
+      <td class="cell-wa">${c.wa?`<a href="${waLink}" target="_blank" rel="noopener">${escH(c.wa)}</a>`:'<span style="color:var(--tx3)">—</span>'}</td>
+      <td>${nicheBadge(c.niche)}</td>
+      <td><div class="count-cell">
+        <button class="count-btn" data-action="order-sub" data-id="${c.id}">−</button>
+        <span class="count-badge ${level}" id="badge-${c.id}">${c.orders}</span>
+        <button class="count-btn" data-action="order-add" data-id="${c.id}">+</button>
+      </div></td>
+      <td class="cell-actions">
+        <button class="action-btn" data-action="edit" data-id="${c.id}" title="Edit"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>
+        <button class="action-btn del" data-action="delete" data-id="${c.id}" title="Hapus"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6M9 6V4h6v2"/></svg></button>
+      </td></tr>`;
+  }).join('');
+}
+
+// ── TABLE EVENTS ───────────────────────────────────────
+document.getElementById('tableBody').addEventListener('click', e => {
+  const btn = e.target.closest('[data-action]');
+  if (!btn) return;
+  const action = btn.dataset.action;
+  const id     = btn.dataset.id;
+  if (action==='order-add')    adjustOrder(id,1);
+  if (action==='order-sub')    adjustOrder(id,-1);
+  if (action==='edit')         startInline(id);
+  if (action==='delete')       openConfirm(id);
+  if (action==='save-inline')  saveInline(id);
+  if (action==='cancel-inline')cancelInline();
+});
+document.getElementById('tableBody').addEventListener('keydown', e => {
+  if (!inlineEditId) return;
+  if (e.key==='Enter') { e.preventDefault(); saveInline(inlineEditId); }
+  if (e.key==='Escape') cancelInline();
+});
+document.getElementById('searchInput').addEventListener('input', renderTable);
+document.getElementById('filterNiche').addEventListener('change', renderTable);
+
+// ── ORDER ──────────────────────────────────────────────
+async function adjustOrder(id, delta) {
+  const c = clients.find(x=>x.id===id);
+  if (!c) return;
+  const newVal = Math.max(0, c.orders+delta);
+  if (newVal===c.orders) return;
+  try {
+    await updateDoc(doc(db,'clients',id), {orders: newVal});
+    const ig = c.ig.startsWith('@')?c.ig:'@'+c.ig;
+    await addLog(delta>0?'add':'sub', ig, 'Order '+(delta>0?'+1':'-1')+' → total '+newVal);
+  } catch(e){ toast('Gagal update','error'); }
+}
+
+// ── INLINE EDIT ────────────────────────────────────────
+function startInline(id) { inlineEditId=id; renderTable(); setTimeout(()=>{ const f=document.querySelector('[data-ie="ig"]'); if(f){f.focus();f.select();} },50); }
+function cancelInline()  { inlineEditId=null; renderTable(); }
+async function saveInline(id) {
+  const c = clients.find(x=>x.id===id);
+  if (!c) return;
+  const igEl  = document.querySelector('[data-ie="ig"]');
+  const waEl  = document.querySelector('[data-ie="wa"]');
+  const nEl   = document.querySelector('[data-ie="niche"]');
+  const ordEl = document.querySelector('[data-ie="ord"]');
+  if (!igEl) return;
+  let ig    = igEl.value.trim();
+  const wa    = waEl?waEl.value.trim():c.wa;
+  const niche = nEl?nEl.value:c.niche;
+  const orders = ordEl?(parseInt(ordEl.value)||0):c.orders;
+  if (!ig) { toast('Instagram tidak boleh kosong','error'); return; }
+  if (!ig.startsWith('@')) ig='@'+ig;
+  try {
+    await updateDoc(doc(db,'clients',id), {ig,wa,niche,orders});
+    await addLog('edit',ig,'Data diperbarui'+(niche?' · '+niche:''));
+    inlineEditId=null;
+    toast('Tersimpan ✓','success');
+  } catch(e){ toast('Gagal simpan','error'); }
+}
+
+// ── ADD CLIENT MODAL ───────────────────────────────────
+function openModal() {
+  document.getElementById('modalTitle').textContent = 'Tambah Client';
+  document.getElementById('inputIG').value     = '';
+  document.getElementById('inputWA').value     = '';
+  document.getElementById('inputOrders').value = '0';
+  document.getElementById('inputNiche').innerHTML = buildNicheOpts('');
+  document.getElementById('overlayClient').classList.add('open');
+  setTimeout(()=>document.getElementById('inputIG').focus(),120);
+}
+function closeModal() { document.getElementById('overlayClient').classList.remove('open'); }
+document.getElementById('btnAdd').addEventListener('click', openModal);
+document.getElementById('btnCloseClient').addEventListener('click', closeModal);
+document.getElementById('btnCancelClient').addEventListener('click', closeModal);
+document.getElementById('overlayClient').addEventListener('click', e=>{ if(e.target===e.currentTarget) closeModal(); });
+
+document.getElementById('clientForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  let ig    = document.getElementById('inputIG').value.trim();
+  const wa    = document.getElementById('inputWA').value.trim();
+  const niche = document.getElementById('inputNiche').value||'';
+  const orders = parseInt(document.getElementById('inputOrders').value)||0;
+  if (!ig.startsWith('@')) ig='@'+ig;
+  try {
+    const ref = await addDoc(collection(db,'clients'), {ig,wa,niche,orders,createdAt:serverTimestamp()});
+    await addLog('new',ig,'Client baru'+(niche?' · '+niche:'')+(orders?' · order awal: '+orders:''));
+    closeModal();
+    toast('Client ditambahkan ✓','success');
+    setTimeout(()=>{ const r=document.getElementById('row-'+ref.id); if(r) r.classList.add('highlight'); },300);
+  } catch(ex){ toast('Gagal tambah client','error'); }
+});
+
+// ── CONFIRM DELETE ─────────────────────────────────────
+function openConfirm(id) {
+  const c = clients.find(x=>x.id===id);
+  if (!c) return;
+  pendingDeleteId = id;
+  const ig = c.ig.startsWith('@')?c.ig:'@'+c.ig;
+  document.getElementById('confirmName').textContent = ig;
+  document.getElementById('overlayConfirm').classList.add('open');
+}
+function closeConfirm() { document.getElementById('overlayConfirm').classList.remove('open'); pendingDeleteId=null; }
+document.getElementById('btnConfirmCancel').addEventListener('click', closeConfirm);
+document.getElementById('overlayConfirm').addEventListener('click', e=>{ if(e.target===e.currentTarget) closeConfirm(); });
+document.getElementById('btnConfirmOk').addEventListener('click', async () => {
+  if (!pendingDeleteId) return;
+  const c = clients.find(x=>x.id===pendingDeleteId);
+  if (!c) { closeConfirm(); return; }
+  const ig = c.ig.startsWith('@')?c.ig:'@'+c.ig;
+  try {
+    await deleteDoc(doc(db,'clients',pendingDeleteId));
+    await addLog('del',ig,'Client dihapus');
+    closeConfirm();
+    toast('Client dihapus','error');
+  } catch(ex){ toast('Gagal hapus','error'); }
+});
+
+// ── NICHE MANAGER ──────────────────────────────────────
+function renderNicheList() {
+  const el = document.getElementById('nicheList');
+  let h = '';
+  DEFAULT_NICHES.forEach(n => { h+=`<div class="niche-row"><span>${escH(n)}</span><span style="font-size:var(--text-xs);color:var(--tx3);font-family:var(--mono)">default</span></div>`; });
+  customNiches.forEach((n,i) => { h+=`<div class="niche-row"><span>${escH(n)}</span><button data-del-niche="${i}" title="Hapus"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/></svg></button></div>`; });
+  if (!customNiches.length) h+='<p style="color:var(--tx3);font-size:var(--text-xs);font-family:var(--mono)">Belum ada niche custom.</p>';
+  el.innerHTML = h;
+}
+document.getElementById('nicheList').addEventListener('click', e => {
+  const btn = e.target.closest('[data-del-niche]');
+  if (!btn) return;
+  const i = parseInt(btn.dataset.delNiche);
+  const name = customNiches[i];
+  customNiches.splice(i,1);
+  saveNiches(); renderNicheList();
+  toast('"'+name+'" dihapus','error');
+});
+document.getElementById('btnNicheManager').addEventListener('click', ()=>{ renderNicheList(); document.getElementById('overlayNiche').classList.add('open'); setTimeout(()=>document.getElementById('newNicheInput').focus(),120); });
+document.getElementById('btnCloseNiche').addEventListener('click', ()=>{ document.getElementById('overlayNiche').classList.remove('open'); renderTable(); });
+document.getElementById('overlayNiche').addEventListener('click', e=>{ if(e.target===e.currentTarget){ document.getElementById('overlayNiche').classList.remove('open'); renderTable(); } });
+function addCustomNiche() {
+  const inp = document.getElementById('newNicheInput');
+  const val = inp.value.trim();
+  if (!val) return;
+  if (allNiches().some(n=>n.toLowerCase()===val.toLowerCase())) { toast('Niche sudah ada','warn'); return; }
+  customNiches.push(val); inp.value='';
+  saveNiches(); renderNicheList();
+  toast('"'+val+'" ditambahkan ✓','success');
+}
+document.getElementById('btnAddNiche').addEventListener('click', addCustomNiche);
+document.getElementById('newNicheInput').addEventListener('keydown', e=>{ if(e.key==='Enter'){e.preventDefault();addCustomNiche();} });
+
+// ── EXPORT EXCEL ───────────────────────────────────────
+document.getElementById('btnExport').addEventListener('click', () => {
+  if (!clients.length) { toast('Tidak ada data','warn'); return; }
+  if (typeof XLSX==='undefined') { toast('Library belum siap','warn'); return; }
+  const wb = XLSX.utils.book_new();
+  const rows = [['No','Instagram','WhatsApp','Niche','Total Order','Tanggal Ditambah']];
+  clients.forEach((c,i) => {
+    const d = c.createdAt ? new Date(c.createdAt.seconds*1000).toLocaleDateString('id-ID',{day:'2-digit',month:'long',year:'numeric'}) : '—';
+    rows.push([i+1,c.ig,c.wa||'',c.niche||'',c.orders,d]);
+  });
+  const ws1 = XLSX.utils.aoa_to_sheet(rows);
+  ws1['!cols'] = [{wch:5},{wch:24},{wch:20},{wch:16},{wch:14},{wch:24}];
+  XLSX.utils.book_append_sheet(wb,ws1,'Database Pelanggan');
+  if (actLog.length) {
+    const logRows = [['Waktu','Instagram','Aktivitas','Keterangan']];
+    const tMap = {new:'Tambah Client',add:'Order +1',sub:'Order -1',edit:'Edit Data',del:'Hapus Client'};
+    actLog.forEach(l=>{ logRows.push([l.ts?new Date(l.ts.seconds*1000).toLocaleString('id-ID'):'—',l.ig,tMap[l.type]||l.type,l.desc]); });
+    const ws2 = XLSX.utils.aoa_to_sheet(logRows);
+    ws2['!cols'] = [{wch:22},{wch:22},{wch:18},{wch:32}];
+    XLSX.utils.book_append_sheet(wb,ws2,'Activity Log');
+  }
+  XLSX.writeFile(wb,'oldboldee_clients_'+new Date().toISOString().slice(0,10)+'.xlsx');
+  toast('Export Excel berhasil ✓','success');
+});
+
+// ── CLEAR LOG ──────────────────────────────────────────
+document.getElementById('btnClearLog').addEventListener('click', async () => {
+  if (!actLog.length) return;
+  try {
+    const batch = actLog.map(l => deleteDoc(doc(db,'log',l.id)));
+    await Promise.all(batch);
+    toast('Log dihapus','warn');
+  } catch(e){ toast('Gagal hapus log','error'); }
+});
+
+// ── ESC ────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  if (e.key!=='Escape') return;
+  closeModal(); closeConfirm();
+  document.getElementById('overlayNiche').classList.remove('open');
+  if (inlineEditId) cancelInline();
+});
+
+// ── TOAST ──────────────────────────────────────────────
+window.toast = function(msg, type) {
+  const wrap = document.getElementById('toastWrap');
+  const el   = document.createElement('div');
+  el.className = 'toast '+(type||'success');
+  const ico = {
+    success:'<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>',
+    error:  '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 6 6 18M6 6l12 12"/></svg>',
+    warn:   '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/></svg>'
+  };
+  el.innerHTML = (ico[type]||ico.success)+msg;
+  wrap.appendChild(el);
+  setTimeout(()=>{ el.style.animation='tOut .3s ease forwards'; setTimeout(()=>el.remove(),300); },2400);
+}
+</script>
+<style>
+:root {
+  --text-xs:clamp(.75rem,.7rem + .25vw,.875rem);--text-sm:clamp(.875rem,.8rem + .35vw,1rem);--text-base:clamp(1rem,.95rem + .25vw,1.125rem);--text-lg:clamp(1.125rem,1rem + .75vw,1.5rem);
+  --sp1:.25rem;--sp2:.5rem;--sp3:.75rem;--sp4:1rem;--sp5:1.25rem;--sp6:1.5rem;--sp8:2rem;--sp12:3rem;
+  --r-sm:.25rem;--r-md:.5rem;--r-lg:.75rem;--r-full:9999px;
+  --ease:180ms cubic-bezier(.16,1,.3,1);
+  --bg:#0a0a0a;--surf:#111;--surf2:#161616;--surf3:#1c1c1c;
+  --border:rgba(255,255,255,.07);--border2:rgba(255,255,255,.13);
+  --tx:#f0f0f0;--tx2:#888;--tx3:#444;
+  --acc:#ff4d00;--acc-h:#ff6a2a;--acc-g:rgba(255,77,0,.22);
+  --green:#00e676;--yellow:#ffc800;--blue:#4dabf7;--purple:#b197fc;
+  --font:'Space Grotesk',sans-serif;--mono:'Space Mono',monospace;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{-webkit-font-smoothing:antialiased}
+body{min-height:100dvh;background:var(--bg);color:var(--tx);font-family:var(--font);font-size:var(--text-base);line-height:1.6}
+button{cursor:pointer;background:none;border:none;font:inherit;color:inherit}
+input,select{font:inherit;color:inherit}
+table{border-collapse:collapse;width:100%}
+::-webkit-scrollbar{width:4px;height:4px}::-webkit-scrollbar-track{background:var(--bg)}::-webkit-scrollbar-thumb{background:#2a2a2a;border-radius:4px}::-webkit-scrollbar-thumb:hover{background:var(--acc)}
+
+/* LOGIN */
+#screenLogin{display:none;min-height:100dvh;align-items:center;justify-content:center;padding:var(--sp4);background:var(--bg)}
+.login-box{width:100%;max-width:400px;background:var(--surf);border:1px solid var(--border2);border-radius:var(--r-lg);padding:var(--sp8);box-shadow:0 24px 80px rgba(0,0,0,.8)}
+.login-logo{display:flex;align-items:center;gap:var(--sp3);margin-bottom:var(--sp8);justify-content:center}
+.logo-dot{width:12px;height:12px;border-radius:50%;background:var(--acc);box-shadow:0 0 12px var(--acc),0 0 24px var(--acc-g);animation:pulse 2s ease-in-out infinite;flex-shrink:0}
+@keyframes pulse{0%,100%{box-shadow:0 0 8px var(--acc),0 0 20px var(--acc-g)}50%{box-shadow:0 0 22px var(--acc),0 0 48px var(--acc-g)}}
+.login-title{font-family:var(--mono);font-weight:700;font-size:var(--text-lg);letter-spacing:-.02em}
+.login-sub{text-align:center;font-size:var(--text-sm);color:var(--tx2);margin-bottom:var(--sp6)}
+.login-error{color:#ff4444;font-size:var(--text-xs);font-family:var(--mono);text-align:center;margin-bottom:var(--sp3);min-height:1.4rem}
+
+/* APP */
+#screenApp{display:none}
+.app{display:grid;grid-template-rows:auto auto 1fr;min-height:100dvh}
+header{border-bottom:1px solid var(--border);padding:var(--sp4) var(--sp6);display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100;background:rgba(10,10,10,.93);backdrop-filter:blur(14px)}
+.logo{display:flex;align-items:center;gap:var(--sp3);font-family:var(--mono);font-weight:700;font-size:clamp(.95rem,1rem + .3vw,1.2rem);letter-spacing:-.02em}
+.hstats{display:flex;align-items:center;gap:var(--sp6);font-family:var(--mono);font-size:var(--text-xs);color:var(--tx2)}
+.stat-val{font-size:var(--text-base);font-weight:700;color:var(--tx);display:block;line-height:1}
+.stat-acc{color:var(--acc)}
+.header-btns{display:flex;gap:var(--sp2);align-items:center}
+.user-chip{font-family:var(--mono);font-size:var(--text-xs);color:var(--tx3);padding:var(--sp1) var(--sp3);border:1px solid var(--border);border-radius:var(--r-full);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+.tabs{display:flex;border-bottom:1px solid var(--border);padding:0 var(--sp6);background:var(--bg)}
+.tab{font-family:var(--mono);font-size:var(--text-xs);text-transform:uppercase;letter-spacing:.08em;padding:var(--sp3) var(--sp5);color:var(--tx2);border-bottom:2px solid transparent;transition:all var(--ease);cursor:pointer}
+.tab:hover{color:var(--tx)}.tab.active{color:var(--acc);border-bottom-color:var(--acc)}
+
+main{padding:var(--sp8) var(--sp6);max-width:1300px;margin:0 auto;width:100%}
+.panel{display:none}.panel.active{display:block}
+
+.toolbar{display:flex;align-items:center;gap:var(--sp4);margin-bottom:var(--sp5);flex-wrap:wrap}
+.search-wrap{flex:1;min-width:200px;position:relative}
+.search-wrap svg{position:absolute;left:var(--sp3);top:50%;transform:translateY(-50%);color:var(--tx2);pointer-events:none}
+.search-input{width:100%;background:var(--surf);border:1px solid var(--border);border-radius:var(--r-md);padding:var(--sp3) var(--sp3) var(--sp3) 2.4rem;color:var(--tx);font-size:var(--text-sm);transition:border-color var(--ease),box-shadow var(--ease);outline:none}
+.search-input:focus{border-color:var(--acc);box-shadow:0 0 0 3px var(--acc-g)}
+.search-input::placeholder{color:var(--tx3)}
+.sort-bar{display:flex;gap:var(--sp2);margin-bottom:var(--sp4);flex-wrap:wrap}
+.sort-btn{font-size:var(--text-xs);font-family:var(--mono);color:var(--tx2);padding:var(--sp1) var(--sp3);border:1px solid transparent;border-radius:var(--r-full);transition:all var(--ease)}
+.sort-btn:hover{color:var(--tx);border-color:var(--border)}.sort-btn.active{color:var(--acc);border-color:var(--acc);background:var(--acc-g)}
+
+.btn{display:inline-flex;align-items:center;gap:var(--sp2);padding:var(--sp3) var(--sp5);border-radius:var(--r-md);font-size:var(--text-sm);font-weight:600;transition:all var(--ease);white-space:nowrap}
+.btn-primary{background:var(--acc);color:#fff;box-shadow:0 0 16px var(--acc-g)}.btn-primary:hover{background:var(--acc-h);box-shadow:0 0 28px var(--acc-g);transform:translateY(-1px)}.btn-primary:active{transform:translateY(0)}
+.btn-danger{background:rgba(255,68,68,.15);color:#ff6b6b;border:1px solid rgba(255,68,68,.4)}.btn-danger:hover{background:rgba(255,68,68,.25);border-color:#ff4444;color:#ff4444}
+.btn-ghost{background:transparent;border:1px solid var(--border);color:var(--tx2)}.btn-ghost:hover{border-color:var(--border2);color:var(--tx)}
+.btn-sm{padding:var(--sp2) var(--sp4);font-size:var(--text-xs)}
+
+.table-wrap{overflow-x:auto;border-radius:var(--r-lg);border:1px solid var(--border)}
+table thead tr{border-bottom:1px solid var(--border2)}
+table th{padding:var(--sp3) var(--sp4);text-align:left;font-size:var(--text-xs);font-family:var(--mono);font-weight:400;color:var(--tx2);letter-spacing:.08em;text-transform:uppercase;background:var(--surf);white-space:nowrap}
+table td{padding:var(--sp3) var(--sp4);border-bottom:1px solid var(--border);vertical-align:middle;font-size:var(--text-sm)}
+table tbody tr:last-child td{border-bottom:none}
+table tbody tr{background:var(--surf);transition:background var(--ease)}table tbody tr:hover{background:var(--surf2)}
+table tbody tr.highlight{animation:rowIn .4s cubic-bezier(.16,1,.3,1)}
+@keyframes rowIn{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:translateY(0)}}
+
+.inline-field{background:var(--surf3);border:1px solid var(--acc);border-radius:var(--r-sm);padding:var(--sp1) var(--sp2);color:var(--tx);font-size:var(--text-sm);outline:none;width:100%;min-width:80px}
+.inline-field:focus{box-shadow:0 0 0 2px var(--acc-g)}
+.inline-num{width:60px;text-align:center;font-family:var(--mono)}
+.inline-select{background:var(--surf3);border:1px solid var(--acc);border-radius:var(--r-sm);padding:var(--sp1) var(--sp2);color:var(--tx);font-size:var(--text-xs);outline:none;font-family:var(--mono);cursor:pointer;min-width:110px}
+
+.cell-num{font-family:var(--mono);font-size:var(--text-xs);color:var(--tx3);width:36px}
+.cell-ig a{color:var(--tx);text-decoration:none;display:flex;align-items:center;gap:var(--sp2);font-weight:600}.cell-ig a:hover{color:var(--acc)}
+.ig-avatar{width:30px;height:30px;border-radius:50%;background:linear-gradient(135deg,#f09433,#e6683c,#dc2743,#cc2366,#bc1888);display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:#fff;flex-shrink:0;font-family:var(--mono)}
+.cell-wa{font-family:var(--mono);font-size:var(--text-xs);color:var(--tx2)}.cell-wa a{color:var(--green);text-decoration:none}.cell-wa a:hover{text-decoration:underline}
+.count-cell{display:flex;align-items:center;gap:var(--sp2)}
+.count-badge{font-family:var(--mono);font-weight:700;font-size:var(--text-sm);min-width:2.4rem;text-align:center;padding:var(--sp1) var(--sp2);border-radius:var(--r-full);background:var(--surf2);border:1px solid var(--border);transition:all var(--ease)}
+.count-badge.high{background:rgba(255,77,0,.15);border-color:var(--acc);color:var(--acc)}.count-badge.med{background:rgba(255,200,0,.1);border-color:rgba(255,200,0,.4);color:var(--yellow)}.count-badge.low{color:var(--tx2)}
+.count-btn{width:26px;height:26px;border-radius:50%;display:flex;align-items:center;justify-content:center;border:1px solid var(--border);color:var(--tx2);font-size:15px;transition:all var(--ease);flex-shrink:0}.count-btn:hover{border-color:var(--acc);color:var(--acc);background:var(--acc-g)}.count-btn:active{transform:scale(.9)}
+.cell-actions{display:flex;align-items:center;gap:var(--sp1)}
+.action-btn{width:30px;height:30px;border-radius:var(--r-md);display:flex;align-items:center;justify-content:center;border:1px solid transparent;color:var(--tx2);transition:all var(--ease)}.action-btn:hover{border-color:var(--border2);color:var(--tx);background:var(--surf2)}
+.action-btn.del:hover{border-color:#ff4444;color:#ff4444;background:rgba(255,68,68,.1)}
+.action-btn.save-ok{color:var(--green)}.action-btn.save-ok:hover{border-color:var(--green);color:var(--green);background:rgba(0,230,118,.1)}
+
+.niche-badge{display:inline-block;padding:2px 10px;border-radius:var(--r-full);font-size:var(--text-xs);font-family:var(--mono);font-weight:600;white-space:nowrap;letter-spacing:.03em}
+.nb-ff{background:rgba(255,77,0,.15);border:1px solid var(--acc);color:var(--acc)}.nb-uscg{background:rgba(77,171,247,.12);border:1px solid var(--blue);color:var(--blue)}.nb-tac{background:rgba(0,230,118,.12);border:1px solid var(--green);color:var(--green)}.nb-custom{background:rgba(177,151,252,.12);border:1px solid var(--purple);color:var(--purple)}.nb-none{background:var(--surf2);border:1px solid var(--border);color:var(--tx3)}
+
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.8);backdrop-filter:blur(6px);z-index:200;display:flex;align-items:center;justify-content:center;padding:var(--sp4);opacity:0;pointer-events:none;transition:opacity var(--ease)}.overlay.open{opacity:1;pointer-events:all}
+.modal{background:var(--surf);border:1px solid var(--border2);border-radius:var(--r-lg);padding:var(--sp8);width:100%;max-width:460px;transform:scale(.96) translateY(8px);transition:transform 240ms cubic-bezier(.16,1,.3,1);box-shadow:0 24px 80px rgba(0,0,0,.85);max-height:90dvh;overflow-y:auto}.overlay.open .modal{transform:scale(1) translateY(0)}
+.modal-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:var(--sp6)}
+.modal-title{font-size:var(--text-lg);font-weight:700}
+.modal-close{width:32px;height:32px;border-radius:var(--r-md);display:flex;align-items:center;justify-content:center;color:var(--tx2);border:1px solid var(--border);transition:all var(--ease)}.modal-close:hover{color:var(--tx);border-color:var(--border2)}
+.form-group{margin-bottom:var(--sp5)}.form-label{display:block;font-size:var(--text-xs);font-family:var(--mono);text-transform:uppercase;letter-spacing:.08em;color:var(--tx2);margin-bottom:var(--sp2)}
+.form-input{width:100%;background:var(--bg);border:1px solid var(--border);border-radius:var(--r-md);padding:var(--sp3) var(--sp4);color:var(--tx);font-size:var(--text-sm);transition:border-color var(--ease),box-shadow var(--ease);outline:none}.form-input:focus{border-color:var(--acc);box-shadow:0 0 0 3px var(--acc-g)}.form-input::placeholder{color:var(--tx3)}
+.form-select{width:100%;background:var(--bg);border:1px solid var(--border);border-radius:var(--r-md);padding:var(--sp3) var(--sp4);color:var(--tx);font-size:var(--text-sm);outline:none;cursor:pointer;transition:border-color var(--ease),box-shadow var(--ease)}.form-select:focus{border-color:var(--acc);box-shadow:0 0 0 3px var(--acc-g)}
+.form-hint{font-size:var(--text-xs);color:var(--tx3);margin-top:var(--sp1)}
+.modal-footer{display:flex;gap:var(--sp3);margin-top:var(--sp6)}.modal-footer .btn{flex:1;justify-content:center}
+.divider{height:1px;background:var(--border);margin:var(--sp5) 0}
+
+.confirm-modal{max-width:360px}
+.confirm-icon{width:48px;height:48px;border-radius:50%;background:rgba(255,68,68,.12);border:1px solid rgba(255,68,68,.3);display:flex;align-items:center;justify-content:center;color:#ff4444;margin:0 auto var(--sp4)}
+.confirm-body{text-align:center}.confirm-name{font-weight:700;font-size:var(--text-lg);margin-bottom:var(--sp2)}.confirm-desc{font-size:var(--text-sm);color:var(--tx2);margin-bottom:var(--sp6)}
+
+.niche-manage{display:flex;flex-direction:column;gap:var(--sp2)}
+.niche-row{display:flex;align-items:center;justify-content:space-between;padding:var(--sp2) var(--sp3);background:var(--surf2);border-radius:var(--r-md);font-size:var(--text-sm);font-family:var(--mono)}.niche-row button{color:var(--tx3);transition:color var(--ease)}.niche-row button:hover{color:#ff4444}
+.add-niche-row{display:flex;gap:var(--sp2);margin-top:var(--sp3)}.add-niche-input{flex:1;background:var(--bg);border:1px solid var(--border);border-radius:var(--r-md);padding:var(--sp2) var(--sp3);color:var(--tx);font-size:var(--text-sm);outline:none;transition:border-color var(--ease)}.add-niche-input:focus{border-color:var(--acc)}.add-niche-input::placeholder{color:var(--tx3)}
+
+.log-toolbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:var(--sp5);flex-wrap:wrap;gap:var(--sp3)}
+.log-list{display:flex;flex-direction:column;gap:var(--sp2)}
+.log-item{background:var(--surf);border:1px solid var(--border);border-radius:var(--r-md);padding:var(--sp3) var(--sp4);display:grid;grid-template-columns:auto 1fr auto;gap:var(--sp3);align-items:center}
+.log-icon{width:32px;height:32px;border-radius:50%;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.log-icon.add{background:rgba(0,230,118,.12);color:var(--green)}.log-icon.sub{background:rgba(255,77,0,.12);color:var(--acc)}.log-icon.new{background:rgba(77,171,247,.12);color:var(--blue)}.log-icon.del{background:rgba(255,68,68,.12);color:#ff4444}.log-icon.edit{background:rgba(255,200,0,.12);color:var(--yellow)}
+.log-info{min-width:0}.log-ig{font-weight:600;font-size:var(--text-sm)}.log-desc{font-size:var(--text-xs);color:var(--tx2)}.log-time{font-family:var(--mono);font-size:var(--text-xs);color:var(--tx3);white-space:nowrap}
+
+.empty-state{text-align:center;padding:var(--sp12) var(--sp8);color:var(--tx2)}.empty-state svg{margin:0 auto var(--sp4);color:var(--tx3)}.empty-state h3{font-size:var(--text-lg);color:var(--tx);margin-bottom:var(--sp2)}.empty-state p{font-size:var(--text-sm);max-width:36ch;margin:0 auto var(--sp6)}
+
+.toast-wrap{position:fixed;bottom:var(--sp6);right:var(--sp6);z-index:400;display:flex;flex-direction:column;gap:var(--sp2);pointer-events:none}
+.toast{background:var(--surf);border:1px solid var(--border2);border-radius:var(--r-md);padding:var(--sp3) var(--sp5);font-size:var(--text-sm);font-family:var(--mono);box-shadow:0 4px 16px rgba(0,0,0,.6);display:flex;align-items:center;gap:var(--sp2);animation:tIn .3s cubic-bezier(.16,1,.3,1)}
+.toast.success{border-color:var(--green);color:var(--green)}.toast.error{border-color:#ff4444;color:#ff4444}.toast.warn{border-color:var(--yellow);color:var(--yellow)}
+@keyframes tIn{from{opacity:0;transform:translateX(20px)}to{opacity:1;transform:translateX(0)}}
+@keyframes tOut{from{opacity:1;transform:translateX(0)}to{opacity:0;transform:translateX(20px)}}
+
+@media(max-width:640px){main{padding:var(--sp4)}header{padding:var(--sp3) var(--sp4)}.hstats{gap:var(--sp4)}.modal{padding:var(--sp6)}}
+</style>
+
+<!-- LOGIN SCREEN -->
+<div id="screenLogin">
+  <div class="login-box">
+    <div class="login-logo">
+      <div class="logo-dot"></div>
+      <span class="login-title">Oldboldee Client DB</span>
+    </div>
+    <p class="login-sub">Masuk untuk akses database client kamu.</p>
+    <div class="login-error" id="loginError"></div>
+    <form id="loginForm">
+      <div class="form-group">
+        <label class="form-label">Email</label>
+        <input class="form-input" type="email" id="loginEmail" placeholder="email@kamu.com" required autocomplete="email">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Password</label>
+        <input class="form-input" type="password" id="loginPass" placeholder="••••••••" required autocomplete="current-password">
+      </div>
+      <button type="submit" class="btn btn-primary" id="btnLogin" style="width:100%;justify-content:center;margin-top:var(--sp2)">Masuk</button>
+    </form>
+  </div>
+</div>
+
+<!-- APP SCREEN -->
+<div id="screenApp">
+<div class="app">
+  <header>
+    <div class="logo">
+      <div class="logo-dot"></div>
+      <span>Oldboldee Client DB</span>
+    </div>
+    <div class="hstats">
+      <div style="text-align:right">
+        <span class="stat-val" id="statClients">0</span>
+        <span style="font-family:var(--mono);font-size:var(--text-xs);color:var(--tx2)">clients</span>
+      </div>
+      <div style="text-align:right">
+        <span class="stat-val stat-acc" id="statOrders">0</span>
+        <span style="font-family:var(--mono);font-size:var(--text-xs);color:var(--tx2)">orders</span>
+      </div>
+    </div>
+    <div class="header-btns">
+      <span class="user-chip" id="userEmail"></span>
+      <button class="btn btn-ghost btn-sm" id="btnExport">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        Excel
+      </button>
+      <button class="btn btn-ghost btn-sm" id="btnNicheManager">Niche</button>
+      <button class="btn btn-primary btn-sm" id="btnAdd">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 5v14M5 12h14"/></svg>
+        Tambah
+      </button>
+      <button class="btn btn-ghost btn-sm" id="btnLogout" title="Logout">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <div class="tabs">
+    <div class="tab active" id="tabClients">Database</div>
+    <div class="tab" id="tabLog">Activity Log</div>
+  </div>
+
+  <main>
+    <div class="panel active" id="panel-clients">
+      <div class="toolbar">
+        <div class="search-wrap">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+          <input class="search-input" id="searchInput" type="text" placeholder="Cari instagram, WA, atau niche…">
+        </div>
+        <select class="form-select" id="filterNiche" style="max-width:160px"><option value="">Semua Niche</option></select>
+      </div>
+      <div class="sort-bar">
+        <button class="sort-btn active" data-sort="default">Terbaru</button>
+        <button class="sort-btn" data-sort="name">Nama A–Z</button>
+        <button class="sort-btn" data-sort="orders">Order Terbanyak</button>
+        <button class="sort-btn" data-sort="niche">Niche</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th style="width:36px">#</th>
+            <th>Instagram</th>
+            <th>WhatsApp</th>
+            <th>Niche</th>
+            <th>Orders</th>
+            <th>Aksi</th>
+          </tr></thead>
+          <tbody id="tableBody"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="panel" id="panel-log">
+      <div class="log-toolbar">
+        <span style="font-family:var(--mono);font-size:var(--text-xs);color:var(--tx2)" id="logCount">0 aktivitas</span>
+        <button class="btn btn-ghost btn-sm" id="btnClearLog">Hapus Semua Log</button>
+      </div>
+      <div class="log-list" id="logList"></div>
+    </div>
+  </main>
+</div>
+</div>
+
+<!-- MODAL: ADD CLIENT -->
+<div class="overlay" id="overlayClient">
+  <div class="modal">
+    <div class="modal-header">
+      <h2 class="modal-title" id="modalTitle">Tambah Client</h2>
+      <button class="modal-close" id="btnCloseClient"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+    </div>
+    <form id="clientForm">
+      <div class="form-group"><label class="form-label">Instagram</label><input class="form-input" type="text" id="inputIG" placeholder="@username" required><p class="form-hint">Tanpa @ juga oke.</p></div>
+      <div class="form-group"><label class="form-label">Nomor WhatsApp</label><input class="form-input" type="text" id="inputWA" placeholder="08xxxxxxxxxx"></div>
+      <div class="form-group"><label class="form-label">Niche</label><select class="form-select" id="inputNiche"></select></div>
+      <div class="form-group"><label class="form-label">Jumlah Order</label><input class="form-input" type="number" id="inputOrders" placeholder="0" min="0" value="0"></div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-ghost" id="btnCancelClient">Batal</button>
+        <button type="submit" class="btn btn-primary" id="btnSave">Simpan</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- MODAL: KONFIRMASI HAPUS -->
+<div class="overlay" id="overlayConfirm">
+  <div class="modal confirm-modal">
+    <div class="confirm-body">
+      <div class="confirm-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6M9 6V4h6v2"/></svg></div>
+      <div class="confirm-name" id="confirmName">@username</div>
+      <div class="confirm-desc">Client ini akan dihapus permanen. Aksi ini tidak bisa dibatalkan.</div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" id="btnConfirmCancel">Batal</button>
+        <button class="btn btn-danger" id="btnConfirmOk"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/></svg> Hapus</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL: NICHE MANAGER -->
+<div class="overlay" id="overlayNiche">
+  <div class="modal">
+    <div class="modal-header">
+      <h2 class="modal-title">Kelola Niche</h2>
+      <button class="modal-close" id="btnCloseNiche"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+    </div>
+    <p style="font-size:var(--text-xs);color:var(--tx2);margin-bottom:var(--sp4);font-family:var(--mono)">Niche default tidak bisa dihapus.</p>
+    <div class="niche-manage" id="nicheList"></div>
+    <div class="divider"></div>
+    <p class="form-label">Tambah Niche Baru</p>
+    <div class="add-niche-row">
+      <input class="add-niche-input" type="text" id="newNicheInput" placeholder="Contoh: EMS, Military…">
+      <button type="button" class="btn btn-primary btn-sm" id="btnAddNiche"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 5v14M5 12h14"/></svg> Tambah</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast-wrap" id="toastWrap"></div>
+</body>
+</html>
